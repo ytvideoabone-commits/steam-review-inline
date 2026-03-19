@@ -1,19 +1,12 @@
 {
   "manifest_version": 3,
-  "name": "Steam Search Review Inline",
-  "version": "1.0.0",
-  "description": "Steam arama sonuçlarında Son İncelemeler ve Bütün İncelemeler bilgisini gösterir.",
-  "permissions": [],
-  "host_permissions": [
-    "https://store.steampowered.com/*"
-  ],
-  "background": {
-    "service_worker": "background.js"
-  },
+  "name": "Steam Search Review Inline (Diagnostic)",
+  "version": "2.1.0",
+  "description": "Teşhis sürümü: Steam arama satırlarına görünür TEST PUAN rozeti ekler.",
   "content_scripts": [
     {
       "matches": [
-        "https://store.steampowered.com/search/*"
+        "https://store.steampowered.com/*"
       ],
       "js": [
         "content.js"
