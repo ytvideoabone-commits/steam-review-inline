@@ -1,58 +1,310 @@
+/*
+ * Steam Search Review Inline - Content Script
+ * Steam arama sonuç satırlarına puan satırı ekler.
+ */
+
 (() => {
-  const LANG = "turkish";
-  const CACHE_TTL = 12 * 60 * 60 * 1000; // 12 saat
-  const MAX_CONCURRENT = 4;
+  const DEBUG_PREFIX = "[SteamInlineScores:content]";
+  const MAX_CONCURRENT_UI = 4;
 
-  const pendingPromises = new Map();
-  const queue = [];
-  let activeCount = 0;
+  const uiQueue = [];
+  const uiInFlight = new Set();
+  let uiActive = 0;
 
-  injectStyles();
-  scanRows();
+  const rowState = new WeakMap();
+  const observedRows = new WeakSet();
 
-  const observer = new MutationObserver(debounce(scanRows, 500));
-  observer.observe(document.body, {
-    childList: true,
-    subtree: true
-  });
+  init();
+
+  function init() {
+    injectStyles();
+    watchRows();
+    initialScan();
+    console.log(`${DEBUG_PREFIX} initialized`);
+  }
 
   function injectStyles() {
-    if (document.getElementById("steam-inline-review-style")) return;
+    if (document.getElementById("steam-inline-scores-style")) return;
 
     const style = document.createElement("style");
-    style.id = "steam-inline-review-style";
+    style.id = "steam-inline-scores-style";
     style.textContent = `
-      .steam-inline-review-box {
+      .steam-inline-scores {
         margin-top: 6px;
-        font-size: 12px;
+        font-size: 11px;
+        color: #9fb0bf;
         line-height: 1.35;
-        color: #8f98a0;
-        white-space: normal;
       }
-
-      .steam-inline-review-line {
-        margin-top: 2px;
+      .steam-inline-scores__line {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
       }
-
-      .steam-inline-review-label {
-        display: inline-block;
-        min-width: 42px;
+      .steam-inline-scores__chip {
+        background: rgba(255,255,255,0.05);
+        border: 1px solid rgba(255,255,255,0.10);
+        border-radius: 4px;
+        padding: 1px 5px;
         color: #c7d5e0;
-        font-weight: 600;
+        white-space: nowrap;
       }
-
-      .steam-inline-review-value {
-        color: #8f98a0;
+      .steam-inline-scores__chip--good {
+        color: #8dd58d;
+        border-color: rgba(141, 213, 141, 0.35);
       }
-
-      .steam-inline-review-loading,
-      .steam-inline-review-empty,
-      .steam-inline-review-error {
-        color: #8f98a0;
-        margin-top: 4px;
+      .steam-inline-scores__chip--mid {
+        color: #e6d47a;
+        border-color: rgba(230, 212, 122, 0.35);
+      }
+      .steam-inline-scores__chip--low {
+        color: #f08a8a;
+        border-color: rgba(240, 138, 138, 0.35);
+      }
+      .steam-inline-scores__chip--loading {
+        opacity: 0.8;
+      }
+      .steam-inline-scores__debug {
+        margin-top: 3px;
+        font-size: 10px;
+        opacity: 0.75;
       }
     `;
+
     document.head.appendChild(style);
+  }
+
+  function watchRows() {
+    const scanDebounced = debounce(initialScan, 300);
+
+    const mutationObserver = new MutationObserver(() => {
+      scanDebounced();
+    });
+
+    mutationObserver.observe(document.body, {
+      childList: true,
+      subtree: true
+    });
+
+    const intersectionObserver = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (!entry.isIntersecting) continue;
+          const row = entry.target;
+          const state = rowState.get(row);
+          if (!state || state.loaded || state.loading) continue;
+          enqueueRowLoad(row);
+        }
+      },
+      {
+        root: null,
+        rootMargin: "250px 0px",
+        threshold: 0.01
+      }
+    );
+
+    window.__steamInlineIntersectionObserver = intersectionObserver;
+  }
+
+  function initialScan() {
+    const rows = document.querySelectorAll("a.search_result_row");
+    const io = window.__steamInlineIntersectionObserver;
+    if (!io) return;
+
+    rows.forEach((row) => {
+      if (observedRows.has(row)) return;
+
+      const appid = extractAppId(row);
+      if (!appid) return;
+
+      const name = extractGameName(row);
+      const itemType = row.getAttribute("data-ds-itemtype") || "";
+
+      const box = ensureScoreBox(row);
+      if (!box) return;
+
+      rowState.set(row, {
+        appid,
+        name,
+        itemType,
+        loaded: false,
+        loading: false,
+        box
+      });
+
+      renderLoading(box);
+
+      observedRows.add(row);
+      io.observe(row);
+    });
+  }
+
+  function ensureScoreBox(row) {
+    let box = row.querySelector(".steam-inline-scores");
+    if (box) return box;
+
+    const nameCol = row.querySelector(".col.search_name");
+    if (!nameCol) return null;
+
+    box = document.createElement("div");
+    box.className = "steam-inline-scores";
+
+    const tags = nameCol.querySelector("p");
+    if (tags?.parentNode) {
+      tags.parentNode.insertBefore(box, tags);
+    } else {
+      nameCol.appendChild(box);
+    }
+
+    return box;
+  }
+
+  function enqueueRowLoad(row) {
+    const state = rowState.get(row);
+    if (!state || state.loaded || state.loading) return;
+    if (uiInFlight.has(state.appid)) return;
+
+    uiQueue.push(row);
+    drainUiQueue();
+  }
+
+  function drainUiQueue() {
+    while (uiActive < MAX_CONCURRENT_UI && uiQueue.length > 0) {
+      const row = uiQueue.shift();
+      const state = rowState.get(row);
+      if (!state || state.loaded || state.loading) continue;
+
+      uiActive += 1;
+      state.loading = true;
+      uiInFlight.add(state.appid);
+
+      fetchScores(state)
+        .then((payload) => {
+          state.loaded = true;
+          state.loading = false;
+          renderScores(state.box, payload?.data || null);
+        })
+        .catch((error) => {
+          state.loaded = true;
+          state.loading = false;
+          console.error(`${DEBUG_PREFIX} row fetch failed`, state.appid, error);
+          renderError(state.box);
+        })
+        .finally(() => {
+          uiInFlight.delete(state.appid);
+          uiActive -= 1;
+          drainUiQueue();
+        });
+    }
+  }
+
+  function fetchScores(state) {
+    return new Promise((resolve, reject) => {
+      chrome.runtime.sendMessage(
+        {
+          type: "GET_SCORES",
+          appid: state.appid,
+          name: state.name,
+          itemType: state.itemType
+        },
+        (response) => {
+          if (chrome.runtime.lastError) {
+            reject(new Error(chrome.runtime.lastError.message));
+            return;
+          }
+
+          if (!response || !response.ok) {
+            reject(new Error(response?.error || "Unknown background error"));
+            return;
+          }
+
+          resolve(response);
+        }
+      );
+    });
+  }
+
+  function renderLoading(box) {
+    box.innerHTML = `
+      <div class="steam-inline-scores__line">
+        <span class="steam-inline-scores__chip steam-inline-scores__chip--loading">MC: …</span>
+        <span class="steam-inline-scores__chip steam-inline-scores__chip--loading">OC: …</span>
+        <span class="steam-inline-scores__chip steam-inline-scores__chip--loading">SDB: …</span>
+        <span class="steam-inline-scores__chip steam-inline-scores__chip--loading">Steam: …</span>
+      </div>
+    `;
+  }
+
+  function renderError(box) {
+    box.innerHTML = `
+      <div class="steam-inline-scores__line">
+        <span class="steam-inline-scores__chip">MC: —</span>
+        <span class="steam-inline-scores__chip">OC: —</span>
+        <span class="steam-inline-scores__chip">SDB: —</span>
+        <span class="steam-inline-scores__chip">Steam: —</span>
+      </div>
+      <div class="steam-inline-scores__debug">veri alınamadı (console)</div>
+    `;
+  }
+
+  function renderScores(box, data) {
+    const mc = asDisplayScore(data?.mc);
+    const oc = asDisplayScore(data?.oc);
+    const sdb = asDisplayScore(data?.sdb);
+    const steam = asDisplayPercent(data?.steam);
+
+    box.innerHTML = `
+      <div class="steam-inline-scores__line">
+        <span class="steam-inline-scores__chip ${scoreClass(data?.mc)}">MC: ${mc}</span>
+        <span class="steam-inline-scores__chip ${scoreClass(data?.oc)}">OC: ${oc}</span>
+        <span class="steam-inline-scores__chip ${scoreClass(data?.sdb)}">SDB: ${sdb}</span>
+        <span class="steam-inline-scores__chip ${scoreClass(data?.steam)}">Steam: ${steam}</span>
+      </div>
+    `;
+
+    if (Array.isArray(data?.errors) && data.errors.length > 0) {
+      box.innerHTML += `<div class="steam-inline-scores__debug">partial: ${escapeHtml(data.errors.join(" | "))}</div>`;
+    }
+  }
+
+  function asDisplayScore(value) {
+    return isValidScore(value) ? String(value) : "—";
+  }
+
+  function asDisplayPercent(value) {
+    return isValidScore(value) ? `%${value}` : "—";
+  }
+
+  function scoreClass(value) {
+    if (!isValidScore(value)) return "";
+    if (value >= 75) return "steam-inline-scores__chip--good";
+    if (value >= 50) return "steam-inline-scores__chip--mid";
+    return "steam-inline-scores__chip--low";
+  }
+
+  function isValidScore(value) {
+    return typeof value === "number" && value >= 1 && value <= 100;
+  }
+
+  function extractAppId(row) {
+    const ds = row.getAttribute("data-ds-appid");
+    if (ds) {
+      const match = ds.match(/\d+/);
+      if (match) return match[0];
+    }
+
+    const href = row.getAttribute("href") || "";
+    const hrefMatch = href.match(/\/app\/(\d+)/);
+    if (hrefMatch) return hrefMatch[1];
+
+    return null;
+  }
+
+  function extractGameName(row) {
+    const title = row.querySelector(".title")?.textContent?.trim();
+    if (title) return title;
+
+    const aria = row.getAttribute("aria-label") || "";
+    return aria.trim();
   }
 
   function debounce(fn, wait) {
@@ -63,111 +315,6 @@
     };
   }
 
-  function scanRows() {
-    const rows = document.querySelectorAll("a.search_result_row");
-    rows.forEach((row) => {
-      ensureRowProcessed(row);
-    });
-  }
-
-  function ensureRowProcessed(row) {
-    const box = getOrCreateBox(row);
-    if (!box) return;
-
-    const appid = extractAppId(row);
-
-    if (!appid) {
-      renderEmpty(box, "Sadece uygulama sayfalarında gösterilir");
-      return;
-    }
-
-    if (box.dataset.loaded === "1") {
-      return;
-    }
-
-    renderLoading(box);
-
-    getReviewData(appid)
-      .then((data) => {
-        renderData(box, data);
-      })
-      .catch((error) => {
-        console.error("Steam inline review error:", error);
-        renderError(box, "Yüklenemedi");
-      });
-  }
-
-  function getOrCreateBox(row) {
-    let box = row.querySelector(".steam-inline-review-box");
-    if (box) return box;
-
-    const nameCol = row.querySelector(".col.search_name");
-    if (!nameCol) return null;
-
-    box = document.createElement("div");
-    box.className = "steam-inline-review-box";
-
-    const tags = nameCol.querySelector("p");
-    if (tags) {
-      tags.parentNode.insertBefore(box, tags);
-    } else {
-      nameCol.appendChild(box);
-    }
-
-    return box;
-  }
-
-  function extractAppId(row) {
-    const dataId = row.getAttribute("data-ds-appid");
-    if (dataId) {
-      const match = dataId.match(/\d+/);
-      if (match) return match[0];
-    }
-
-    const href = row.getAttribute("href") || "";
-    const match = href.match(/\/app\/(\d+)/);
-    if (match) return match[1];
-
-    return null;
-  }
-
-  function renderLoading(box) {
-    box.innerHTML = `<div class="steam-inline-review-loading">İncelemeler yükleniyor...</div>`;
-    box.dataset.loaded = "0";
-  }
-
-  function renderEmpty(box, text = "İnceleme verisi yok") {
-    box.innerHTML = `<div class="steam-inline-review-empty">${escapeHtml(text)}</div>`;
-    box.dataset.loaded = "1";
-  }
-
-  function renderError(box, text = "Hata") {
-    box.innerHTML = `<div class="steam-inline-review-error">${escapeHtml(text)}</div>`;
-    box.dataset.loaded = "1";
-  }
-
-  function renderData(box, data) {
-    const recent = data?.recent || "—";
-    const all = data?.all || "—";
-
-    if (!data?.recent && !data?.all) {
-      renderEmpty(box, "İnceleme verisi bulunamadı");
-      return;
-    }
-
-    box.innerHTML = `
-      <div class="steam-inline-review-line">
-        <span class="steam-inline-review-label">Son:</span>
-        <span class="steam-inline-review-value">${escapeHtml(recent)}</span>
-      </div>
-      <div class="steam-inline-review-line">
-        <span class="steam-inline-review-label">Tümü:</span>
-        <span class="steam-inline-review-value">${escapeHtml(all)}</span>
-      </div>
-    `;
-    box.dataset.loaded = "1";
-  }
-
   function escapeHtml(value) {
     return String(value)
       .replaceAll("&", "&amp;")
@@ -175,156 +322,5 @@
       .replaceAll(">", "&gt;")
       .replaceAll('"', "&quot;")
       .replaceAll("'", "&#39;");
-  }
-
-  function getReviewData(appid) {
-    const cached = loadCache(appid);
-    if (cached) {
-      return Promise.resolve(cached);
-    }
-
-    if (pendingPromises.has(appid)) {
-      return pendingPromises.get(appid);
-    }
-
-    const promise = enqueue(async () => {
-      const html = await fetchAppPage(appid);
-      const parsed = parseReviewSummary(html);
-      saveCache(appid, parsed);
-      return parsed;
-    }).finally(() => {
-      pendingPromises.delete(appid);
-    });
-
-    pendingPromises.set(appid, promise);
-    return promise;
-  }
-
-  function enqueue(taskFn) {
-    return new Promise((resolve, reject) => {
-      queue.push({ taskFn, resolve, reject });
-      runQueue();
-    });
-  }
-
-  function runQueue() {
-    while (activeCount < MAX_CONCURRENT && queue.length > 0) {
-      const item = queue.shift();
-      activeCount++;
-
-      Promise.resolve()
-        .then(item.taskFn)
-        .then(item.resolve)
-        .catch(item.reject)
-        .finally(() => {
-          activeCount--;
-          runQueue();
-        });
-    }
-  }
-
-  function fetchAppPage(appid) {
-    return new Promise((resolve, reject) => {
-      chrome.runtime.sendMessage(
-        {
-          type: "FETCH_APP_PAGE",
-          appid,
-          lang: LANG
-        },
-        (response) => {
-          if (chrome.runtime.lastError) {
-            reject(new Error(chrome.runtime.lastError.message));
-            return;
-          }
-
-          if (!response || !response.ok) {
-            reject(new Error(response?.error || "İstek başarısız"));
-            return;
-          }
-
-          resolve(response.html);
-        }
-      );
-    });
-  }
-
-  function parseReviewSummary(html) {
-    const doc = new DOMParser().parseFromString(html, "text/html");
-    const rows = Array.from(doc.querySelectorAll(".user_reviews_summary_row"));
-
-    let recent = null;
-    let all = null;
-
-    for (const row of rows) {
-      const subtitle =
-        row.querySelector(".subtitle")?.textContent?.trim().toLowerCase() ||
-        row.textContent.trim().toLowerCase();
-
-      const summaryEl = row.querySelector(".game_review_summary");
-      if (!summaryEl) continue;
-
-      const summaryText = summaryEl.textContent.trim();
-
-      let countText = "";
-      const spans = Array.from(row.querySelectorAll("span"));
-      for (const span of spans) {
-        const txt = span.textContent.trim();
-        if (/^\(\s*[\d.,]+\s*\)$/.test(txt)) {
-          countText = txt;
-          break;
-        }
-      }
-
-      const finalText = `${summaryText}${countText ? " " + countText : ""}`.trim();
-
-      if (
-        subtitle.includes("en son incelemeler") ||
-        subtitle.includes("recent reviews")
-      ) {
-        recent = finalText;
-      }
-
-      if (
-        subtitle.includes("bütün incelemeler") ||
-        subtitle.includes("all reviews")
-      ) {
-        all = finalText;
-      }
-    }
-
-    return { recent, all };
-  }
-
-  function loadCache(appid) {
-    try {
-      const raw = sessionStorage.getItem(`steam-inline-review:${appid}`);
-      if (!raw) return null;
-
-      const parsed = JSON.parse(raw);
-      if (!parsed || !parsed.time || !parsed.data) return null;
-
-      if (Date.now() - parsed.time > CACHE_TTL) {
-        sessionStorage.removeItem(`steam-inline-review:${appid}`);
-        return null;
-      }
-
-      return parsed.data;
-    } catch {
-      return null;
-    }
-  }
-
-  function saveCache(appid, data) {
-    try {
-      sessionStorage.setItem(
-        `steam-inline-review:${appid}`,
-        JSON.stringify({
-          time: Date.now(),
-          data
-        })
-      );
-    } catch {
-      // sessiz geç
-    }
   }
 })();

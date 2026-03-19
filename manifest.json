@@ -1,11 +1,17 @@
 {
   "manifest_version": 3,
   "name": "Steam Search Review Inline",
-  "version": "1.0.0",
-  "description": "Steam arama sonuçlarında Son İncelemeler ve Bütün İncelemeler bilgisini gösterir.",
-  "permissions": [],
+  "version": "2.0.0",
+  "description": "Steam arama sonuçlarında MC / OC / SteamDB / Steam puanlarını gösterir.",
+  "permissions": [
+    "storage"
+  ],
   "host_permissions": [
-    "https://store.steampowered.com/*"
+    "https://store.steampowered.com/*",
+    "https://steamdb.info/*",
+    "https://opencritic.com/*",
+    "https://www.metacritic.com/*",
+    "https://metacritic.com/*"
   ],
   "background": {
     "service_worker": "background.js"
