@@ -1,25 +1,12 @@
 {
   "manifest_version": 3,
-  "name": "Steam Search Review Inline",
-  "version": "2.0.0",
-  "description": "Steam arama sonuçlarında MC / OC / SteamDB / Steam puanlarını gösterir.",
-  "permissions": [
-    "storage"
-  ],
-  "host_permissions": [
-    "https://store.steampowered.com/*",
-    "https://steamdb.info/*",
-    "https://opencritic.com/*",
-    "https://www.metacritic.com/*",
-    "https://metacritic.com/*"
-  ],
-  "background": {
-    "service_worker": "background.js"
-  },
+  "name": "Steam Search Review Inline (Diagnostic)",
+  "version": "2.1.0",
+  "description": "Teşhis sürümü: Steam arama satırlarına görünür TEST PUAN rozeti ekler.",
   "content_scripts": [
     {
       "matches": [
-        "https://store.steampowered.com/search/*"
+        "https://store.steampowered.com/*"
       ],
       "js": [
         "content.js"
